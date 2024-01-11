@@ -52,7 +52,9 @@ def geometric_median(X, eps=1e-5):
         y = y1
 
 
-def project_point_on_line_3d(line: np.ndarray, point: np.ndarray) -> tuple:
+def project_point_on_line_3d(line: np.ndarray,
+                             point: np.ndarray
+                             ) -> tuple[int, np.ndarray]:
     """
     Find the vertex on a line made from multiple segments that is closest to another
     point.
@@ -176,13 +178,20 @@ if __name__ == "__main__":
     assert markers_pixel.size == markers_data.size
     # the markers need to be sorted
     assert np.all(np.sort(markers_pixel) == markers_pixel)
+    # the data needs to be sorted but the direction doesn't matter
+    if np.all(np.sort(markers_data) == markers_data):
+        marker_data_sorted = 1
+    elif np.all(np.sort(markers_data) == np.flip(markers_data)):
+        marker_data_sorted = -1
+    else:
+        raise AssertionError
     # test for a valid filename with extension
     assert ("." in output_name) and (output_name.split(".")[-1] in ["npy", "txt"])
     # test that ignore_black is either unset or non-negative
     assert (ignore_black is None) or (ignore_black >= 0)
 
     # load image file as NumPy array, discard opacity values
-    img = np.asarray(Image.open(args.filename))[:, :, :3]
+    img = np.asarray(Image.open(args.filename))[:, :, :3].astype(int)
 
     # get median colors from each grid value
     # get grid that defines the different sub-images
@@ -248,15 +257,23 @@ if __name__ == "__main__":
         from matplotlib.colors import ListedColormap, BoundaryNorm
         from matplotlib.cm import ScalarMappable
         # create function that maps data to original colorbar indices
-        value_to_index = CubicSpline(markers_data, steps_plot_indicized)
+        if marker_data_sorted == 1:  # ascending
+            value_to_index = CubicSpline(markers_data, steps_plot_indicized)
+        else:  # descending
+            value_to_index = CubicSpline(np.flip(markers_data), np.flip(steps_plot_indicized))
         # get the unique values and colors we extracted
         unique_values = np.unique(values.ravel())
         unique_colindex = value_to_index(unique_values).round().astype(int)
         unique_colors = colorline[unique_colindex]
         # make a discrete colormap using those values
-        borders = np.array([markers_data[0]]
-                           + ((unique_values[1:] + unique_values[:-1]) / 2).tolist()
-                           + [markers_data[-1]])
+        if marker_data_sorted == 1:
+            borders = np.array([markers_data[0]]
+                               + ((unique_values[1:] + unique_values[:-1]) / 2).tolist()
+                               + [markers_data[-1]])
+        else:
+            borders = np.array([markers_data[-1]]
+                               + ((unique_values[1:] + unique_values[:-1]) / 2).tolist()
+                               + [markers_data[0]])
         cmap = ListedColormap(unique_colors / 255)
         norm = BoundaryNorm(borders, cmap.N)
         # start the figure

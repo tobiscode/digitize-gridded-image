@@ -41,8 +41,8 @@ display the usage message:
 
 ## Example
 
-Suppose you want to get the data from a plot like the bottom right one one in this [Matplotlib example
-](https://matplotlib.org/3.8.2/gallery/images_contours_and_fields/image_annotated_heatmap.html),
+Suppose you want to get the data from a plot like the bottom right one one in this [Matplotlib
+example](https://matplotlib.org/3.8.2/gallery/images_contours_and_fields/image_annotated_heatmap.html),
 section *Some more complex heatmap examples*.
 We want to analyze each colored patch on the grid and then use the provided colormap to estimate what
 value was used to generate the color for the patch.
@@ -87,6 +87,25 @@ The data values we get (in `data_out.txt`) are:
 
 which are pretty close to the true values (which are kindly included in the Matplotlib
 example figure).
+
+This also works for categorical data, e.g.:
+
+    python digitize_gridded_image.py image_in.png "[117, 379, 313, 574]" "[335, 377, 335, 577]" "[390, 419, 448, 477, 506, 535, 564]" '["A", "B", "C", "D", "E", "F", "G"]' 6 6 data_out_cat.txt --recreate-image=image_out_cat.png
+
+Yielding the data
+
+|   |   |   |   |   |   |
+|---|---|---|---|---|---|
+| E | E | C | E | D | D |
+| C | F | D | E | C | C |
+| C | D | C | E | D | D |
+| G | E | D | D | D | B |
+| D | D | C | B | E | C |
+| C | C | E | B | E | B |
+
+and the image
+
+![Recreated image from categorical example](image_out_cat.png)
 
 Finally, the option `--ignore-blacks` is present for cases where the colored grid data is overlain
 by other elements like lines or text that make it harder for the algorithm to extract the dominant

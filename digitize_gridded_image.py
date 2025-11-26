@@ -221,8 +221,8 @@ if __name__ == "__main__":
     colorline = img[legend_box[1]:legend_box[3] + 1,
                     legend_box[0]:legend_box[2] + 1, :].squeeze()
     # map the pixel indices of the markers to the colorbar location
-    steps_plot_indicized = ((markers_pixel - markers_pixel.min())
-                            / (markers_pixel.max() - markers_pixel.min())
+    steps_plot_indicized = ((markers_pixel - legend_box[1])
+                            / (legend_box[3] - legend_box[1])
                             * (colorline.shape[0] - 1)).round().astype(int)
     # find the unique colors of the colorbar and preserve their order
     _, colorline_uniqind = np.unique(colorline, axis=0, return_index=True)
@@ -236,11 +236,19 @@ if __name__ == "__main__":
             # to the dominant color that was extracted in the previous step
             indices_unique[i, j], gix = \
                 project_point_on_line_3d(colorline_unique, cmed[i, j, :])
-            # since colors can repeat in a colorbar, we need to decid which pixel
-            # to map into data space - here we use the first one
-            indices_general[i, j] = np.flatnonzero(np.all(gix == colorline, axis=1)).min()
+            # since colors can repeat in a colorbar, we need to decide which pixel
+            # to map into data space - here we use the mean one
+            indices_general[i, j] = np.flatnonzero(np.all(gix == colorline, axis=1)).mean()
     # create an interpolant function that maps colorbar indices to the data space
-    pixel_to_value = CubicSpline(steps_plot_indicized, markers_data)
+    try:
+        pixel_to_value = CubicSpline(steps_plot_indicized, markers_data)
+        categorical = False
+    # catch the case where the markers are categorical
+    except ValueError:
+        pixel_to_value = lambda index: markers_data[
+                np.argmin(np.abs(steps_plot_indicized[:, None] - index.reshape(1, -1)),
+                          axis=0).reshape(args.ny, args.nx)]
+        categorical = True
     # convert the extracted colorbar indices to data space
     values = pixel_to_value(indices_general)
 
@@ -249,41 +257,56 @@ if __name__ == "__main__":
     if out_fmt == "npy":
         np.save(output_name, values)
     elif out_fmt == "txt":
-        np.savetxt(output_name, values)
+        np.savetxt(output_name, values, fmt="%s" if categorical else "%.18e")
 
     # recreate image if desired
     if recreate_image is not None:
+        # delayed imports
         import matplotlib.pyplot as plt
         from matplotlib.colors import ListedColormap, BoundaryNorm
         from matplotlib.cm import ScalarMappable
         # create function that maps data to original colorbar indices
-        if marker_data_sorted == 1:  # ascending
-            value_to_index = CubicSpline(markers_data, steps_plot_indicized)
-        else:  # descending
-            value_to_index = CubicSpline(np.flip(markers_data), np.flip(steps_plot_indicized))
-        # get the unique values and colors we extracted
-        unique_values = np.unique(values.ravel())
-        unique_colindex = value_to_index(unique_values).round().astype(int)
-        unique_colors = colorline[unique_colindex]
-        # make a discrete colormap using those values
-        if marker_data_sorted == 1:
-            borders = np.array([markers_data[0]]
-                               + ((unique_values[1:] + unique_values[:-1]) / 2).tolist()
-                               + [markers_data[-1]])
+        if categorical:
+            # reuse the step indices of our markers directly
+            # make a discrete colormap using those values
+            unique_colindex = steps_plot_indicized
+            borders = np.array([0]
+                               + ((unique_colindex[1:] + unique_colindex[:-1]) / 2).tolist()
+                               + [colorline.shape[0] - 1])
         else:
-            borders = np.array([markers_data[-1]]
-                               + ((unique_values[1:] + unique_values[:-1]) / 2).tolist()
-                               + [markers_data[0]])
+            if marker_data_sorted == 1:  # ascending
+                value_to_index = CubicSpline(markers_data, steps_plot_indicized)
+            else:  # descending
+                value_to_index = CubicSpline(np.flip(markers_data), np.flip(steps_plot_indicized))
+            # get the unique values and colors we extracted
+            unique_values = np.unique(values.ravel())
+            unique_colindex = value_to_index(unique_values).round().astype(int)
+            # make a discrete colormap using those values
+            if marker_data_sorted == 1:
+                borders = np.array([markers_data[0]]
+                                + ((unique_values[1:] + unique_values[:-1]) / 2).tolist()
+                                + [markers_data[-1]])
+            else:
+                borders = np.array([markers_data[-1]]
+                                + ((unique_values[1:] + unique_values[:-1]) / 2).tolist()
+                                + [markers_data[0]])
+        unique_colors = colorline[unique_colindex]
         cmap = ListedColormap(unique_colors / 255)
         norm = BoundaryNorm(borders, cmap.N)
         # start the figure
         plt.figure()
         # add the recreated data using the colors we estimated
-        plt.imshow(values, cmap=cmap, norm=norm)
+        plt.imshow(indices_general.astype(float) if categorical else values, cmap=cmap, norm=norm)
         # add the colorbar
-        plt.colorbar(mappable=ScalarMappable(norm=norm, cmap=cmap),
-                     ax=plt.gca(),
-                     label="Data Units")
+        cbar = plt.colorbar(mappable=ScalarMappable(norm=norm, cmap=cmap),
+                            ax=plt.gca(),
+                            label="Data Units")
+        if categorical:
+            cbar.set_ticks(steps_plot_indicized.astype(float), labels=markers_data)
+            cbar.ax.invert_yaxis()
+        else:
+            cbar.set_ticks(unique_values, labels=[""] * unique_values.size, minor=True)
+            cbar.set_ticks(unique_values[np.linspace(0, unique_values.size - 1, num=10, dtype=int)])
         # add info
         plt.title("Recreated Image")
         plt.xlabel("X Index")

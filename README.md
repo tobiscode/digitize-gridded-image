@@ -38,6 +38,9 @@ display the usage message:
                             If provided, also save a debugging image with the extracted colors to the specified filename.
       --ignore-black IGNORE_BLACK
                             When extracting the dominant colors, ignore pixels this far away in RGB space from true black using Euclidean 3D distances.
+      --nan-colors RGB        JSON-formatted string of an [r, g, b] color that stands for missing data; may be given multiple times.
+      --nan-colors-tol NAN_COLORS_TOL
+                            Distance in RGB space up to which the dominant color of a cell counts as being one of the --nan-colors (default 5).
 
 ## Example
 
@@ -111,6 +114,16 @@ Finally, the option `--ignore-blacks` is present for cases where the colored gri
 by other elements like lines or text that make it harder for the algorithm to extract the dominant
 color. Those elements are often in shades of black / dark grey and can be ignored from the
 estimation. This however only works if the colorbar itself doesn't include dark colors.
+
+If the plot marks missing data with a fixed color rather than leaving it out - typically the white
+of the background or the black of a cell border - those cells can be turned into missing values
+with `--nan-colors`, which takes an `[r, g, b]` color and may be repeated for several colors. The
+data value of every cell whose dominant color equals such a color (within the distance given by
+`--nan-colors-tol`, defaulting to 5) becomes NaN; for categorical data, the missing cells are
+written as the empty string. For example, to extract the data of a plot whose missing data is
+marked in white and black:
+
+    python digitize_gridded_image.py image_in.png "[498, 379, 693, 574]" "[715, 377, 715, 577]" "[377, 427, 477, 527, 577]" "[1, 0.5, 0, -0.5, -1]" 7 7 data_out.txt --nan-colors="[255, 255, 255]" --nan-colors="[0, 0, 0]"
 
 ## Acknowledgments
 

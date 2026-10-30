@@ -239,6 +239,41 @@ def extract_dominant_colors(
     return np.clip(cmed, a_min=0, a_max=255).astype(int)
 
 
+def nan_color_mask(
+    cmed: NDArray[Any], nan_colors: NDArray[Any], tolerance: float
+) -> NDArray[Any]:
+    """
+    The cells whose dominant color is one of the colors meaning missing data.
+
+    Plots often mark missing data with a fixed color rather than leaving it
+    out - typically the white of the background or the black of a cell border -
+    so the dominant color of such a cell carries no value and has to become
+    NaN rather than the data value its color happens to lie nearest to.
+
+    Parameters
+    ----------
+    cmed
+        Array of shape (ny, nx, 3) with the dominant color of every cell, as
+        returned by `extract_dominant_colors`.
+    nan_colors
+        Array of shape (n, 3) with the RGB colors that stand for missing data.
+    tolerance
+        Distance in RGB space up to which the color of a cell counts as being
+        one of the NaN colors, using Euclidean 3D distances as `ignore_black`
+        does.
+
+    Returns
+    -------
+    masked
+        Boolean array of shape (ny, nx), True where the dominant color of the
+        cell equals one of the NaN colors.
+    """
+    distance = np.sqrt(
+        np.sum((cmed[:, :, None, :] - nan_colors[None, None, :, :]) ** 2, axis=3)
+    )
+    return np.any(distance <= tolerance, axis=2)
+
+
 def extract_colorline(img: RGBImage, legend_box: Box) -> NDArray[Any]:
     """
     Extract the colorbar of an image as a sequence of colors.
@@ -548,8 +583,9 @@ def recreate_image(
             value_to_index = CubicSpline(markers_data, marker_indices)
         else:  # descending
             value_to_index = CubicSpline(np.flip(markers_data), np.flip(marker_indices))
-        # get the unique values and colors we extracted
-        unique_values = np.unique(values.ravel())
+        # get the unique values and colors we extracted, skipping the missing
+        # cells, which carry no value and take the bad color of the colormap
+        unique_values = np.unique(values[np.isfinite(values)])
         unique_colindex = value_to_index(unique_values).round().astype(int)
         # make a discrete colormap using those values
         if marker_data_sorted == 1:
@@ -726,6 +762,28 @@ def main() -> None:
             "RGB space from true black using Euclidean 3D distances."
         ),
     )
+    prs.add_argument(
+        "--nan-colors",
+        type=str,
+        action="append",
+        default=None,
+        metavar="RGB",
+        help=(
+            "JSON-formatted string of an [r, g, b] color that stands for missing "
+            'data, e.g. "[255, 255, 255]" for the white of a mask; may be given '
+            "multiple times. The data value of every cell whose dominant color "
+            "equals such a color becomes NaN."
+        ),
+    )
+    prs.add_argument(
+        "--nan-colors-tol",
+        type=float,
+        default=5.0,
+        help=(
+            "Distance in RGB space up to which the dominant color of a cell "
+            "counts as being one of the --nan-colors (default 5)."
+        ),
+    )
 
     # print help if wrongly called
     if len(sys.argv) == 1:
@@ -743,6 +801,12 @@ def main() -> None:
     output_name = args.output_name
     recreate = args.recreate_image
     ignore_black = args.ignore_black
+    nan_colors = (
+        np.asarray([json.loads(entry) for entry in args.nan_colors])
+        if args.nan_colors is not None
+        else None
+    )
+    nan_colors_tol = args.nan_colors_tol
 
     # input checks
     marker_data_sorted = validate_inputs(
@@ -772,6 +836,20 @@ def main() -> None:
     values = map_indices_to_values(
         index_to_value, categorical, indices_general, (ny, nx)
     )
+
+    # cells whose color stands for missing data get no value at all
+    if nan_colors is not None:
+        nan_colors = np.atleast_2d(nan_colors).astype(float)
+        assert nan_colors.shape[1] == 3, "every NaN color needs three channels"
+        masked = nan_color_mask(cmed, nan_colors, nan_colors_tol)
+        if categorical:
+            # categorical labels cannot hold NaN, so the missing cells lose
+            # their label and are written as the empty string
+            values = np.asarray(values, dtype=object)
+            values[masked] = ""
+        else:
+            values = np.asarray(values, dtype=float)
+            values[masked] = np.nan
 
     # save 2D data array
     save_values(values, output_name, categorical)

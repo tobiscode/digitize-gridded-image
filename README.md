@@ -125,6 +125,111 @@ marked in white and black:
 
     python digitize_gridded_image.py image_in.png "[498, 379, 693, 574]" "[715, 377, 715, 577]" "[377, 427, 477, 527, 577]" "[1, 0.5, 0, -0.5, -1]" 7 7 data_out.txt --nan-colors="[255, 255, 255]" --nan-colors="[0, 0, 0]"
 
+## Multi-panel figures
+
+A figure made of many small panels - a grid of heatmap or map subplots whose
+rows share a colorbar each - is handled by a pipeline of four scripts. The
+first three measure the geometry of the figure (where its panels are, and
+where the cells inside them are separated), and the last one digitizes every
+panel with the color logic of `digitize_gridded_image.py` and stacks the
+results into one array. Each script takes one step and prints what it found;
+the first and last can also draw a debug picture to verify the result by eye.
+Below, `figure.png` stands for the image of your figure.
+
+### 1. Locate the panels: `panel_lattice.py`
+
+    python panel_lattice.py figure.png n_rows n_cols x y width height [--overlay]
+
+The four numbers `x y width height` are an inclusive reference box inside the
+top-left panel - a region whose picture cross-correlates cleanly against the
+other panels, e.g. a data disk rather than a white corner. The script finds
+every panel by cross-correlation, derives the panel windows from the white
+gutters between them, and writes `figure_lattice.json` (with `--overlay`, also
+an image showing the windows for verification). The lattice file records the
+panel anchors, the column window positions and widths, and the geometry the
+scripts below add to it.
+
+### 2. Measure the cell size: `cell_fft.py`
+
+    python cell_fft.py figure_lattice.json
+
+The cells (the colored patches inside a panel) all share a pixel width and
+height, and their thin antialiased seams show up as a peak in the Fourier
+spectrum of the panels' brightness differences. Stacking the spectra of all
+panels makes the shared cell period stand out against the structure of the
+individual panels. The script reports the sub-pixel cell width and height and
+stores them in the lattice file as `cell_size_px`.
+
+### 3. Fit the cell grid: `cell_grid.py`
+
+    python cell_grid.py figure_lattice.json [--overlay]
+
+With the shared cell size known, only the alignment of the seams inside each
+panel is open. A seam is an antialiased boundary where the colors of the two
+sides differ, so the script probes sub-pixel shifts of the seam lattice and
+picks the shift whose seam lines show the mean color jump; it stores the
+integer seam positions of every panel in the lattice file, together with
+diagnostics on how confidently each phase is supported (`--overlay` draws the
+fitted grid for verification).
+
+### 4. Digitize: `digitize_multi_image.py`
+
+    usage: digitize_multi_image.py [-h] [--save-panels DIRECTORY]
+                                   [--recreate-image FILENAME]
+                                   [--row-labels JSON] [--column-labels JSON]
+                                   lattice_json bars_json output
+
+    Digitize every panel of a multi-panel figure into one four-dimensional
+    array.
+
+    positional arguments:
+      lattice_json            Lattice file written by panel_lattice.py.
+      bars_json               JSON file with one 'bars' entry per panel row: a
+                              legend_box [left, top, right, bottom] with left =
+                              right at the colorbar of that row, and the data
+                              values [top, bottom] at its two ends.
+      output                  Filename of the stacked data array, with a .npy
+                              extension.
+
+    options:
+      --save-panels DIRECTORY Also save every panel's values as
+                              DIRECTORY/<stem>_r<row>_c<col>.txt.
+      --recreate-image FILENAME
+                              If provided, also save the recreated figure to
+                              this filename, with a small colorbar next to
+                              every panel as in the original figure.
+      --row-labels JSON       JSON-formatted string of the label of every
+                              panel row, e.g. ["SO2 [ppmv]", ...]; drawn to the
+                              left of each row of panels.
+      --column-labels JSON    JSON-formatted string of the label of every panel
+                              column, e.g. ["a", "b", "c", "d"]; drawn below
+                              each column of panels.
+
+The bars file names the color scale of each panel row; the figures this was
+built for have colorbars without tick marks, so the two end values are all
+that is needed. An optional `label` per row names that row, which the
+recreated figure uses unless `--row-labels` overrides it:
+
+    {
+      "bars": [
+        {"label": "SO2 [ppmv]", "legend_box": [715, 377, 715, 577], "values": [4.0, 0.0]},
+        {"label": "CO [ppbv]",  "legend_box": [715, 377, 715, 577], "values": [200.0, 50.0]}
+      ]
+    }
+
+A cell is masked when it holds no colored pixel at all, which covers white
+mask fill, enclosed white, and black or gray mask shades alike. Because the
+panels align at their seam lattice rather than their corners, the values of
+all panels stack into one array of shape `(ny, nx, n_rows, n_columns)`, where
+nx (ny) is the largest cell count reached by any panel column (row); slots no
+panel reaches are NaN, as are masked cells. For example:
+
+    python digitize_multi_image.py figure_lattice.json bars.json values.npy --column-labels '["a", "b", "c", "d"]' --recreate-image=figure_recreated.png
+
+The recreated image draws the stacked array back panel by panel, each with its
+own small colorbar, so missing cells show as blank and any misalignment is
+visible by eye.
+
 ## Acknowledgments
 
 Part of this code is copied from [StackOverflow](https://stackoverflow.com/a/30305181/13054094)

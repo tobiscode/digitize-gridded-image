@@ -12,7 +12,6 @@ import numpy as np
 from argparse import ArgumentParser
 from numpy.typing import NDArray
 from PIL import Image
-from scipy.spatial.distance import cdist, euclidean
 from scipy.interpolate import CubicSpline
 
 # An RGB image as an array of shape (height, width, 3) with integer color
@@ -28,7 +27,8 @@ Values = NDArray[Any]
 IndexToValue = Callable[[NDArray[Any]], Values]
 
 
-# copied from https://stackoverflow.com/a/30305181/13054094,
+# The Weiszfeld iteration in `geometric_medians` below is a derivative of
+# code copied from https://stackoverflow.com/a/30305181/13054094,
 # licensed under https://creativecommons.org/licenses/by-sa/3.0/,
 # below the original comment from orlp:
 # ------------------------------------------------------------------------------
@@ -39,99 +39,203 @@ IndexToValue = Callable[[NDArray[Any]], Values]
 # In addition to the default SO license terms, I release the code above under
 # the zlib license, if you so prefer.
 # ------------------------------------------------------------------------------
-def geometric_median(X, eps=1e-5):
-    y = np.mean(X, 0)
-
-    while True:
-        D = cdist(X, [y])
-        nonzeros = (D != 0)[:, 0]
-
-        Dinv = 1 / D[nonzeros]
-        Dinvs = np.sum(Dinv)
-        W = Dinv / Dinvs
-        T = np.sum(W * X[nonzeros], 0)
-
-        num_zeros = len(X) - np.sum(nonzeros)
-        if num_zeros == 0:
-            y1 = T
-        elif num_zeros == len(X):
-            return y
-        else:
-            R = (T - y) * Dinvs
-            r = np.linalg.norm(R)
-            rinv = 0 if r == 0 else num_zeros / r
-            y1 = max(0, 1 - rinv) * T + min(1, rinv) * y
-
-        if euclidean(y, y1) < eps:
-            return y1
-
-        y = y1
-
-
-def project_point_on_line_3d(
-    line: np.ndarray, point: np.ndarray
-) -> tuple[int, np.ndarray]:
+def geometric_medians(
+    P: NDArray[Any],
+    owner: NDArray[Any],
+    n_cells: int,
+    eps: float = 1e-5,
+    max_iter: int = 1000,
+) -> NDArray[Any]:
     """
-    Find the vertex on a line made from multiple segments that is closest to another
-    point.
-    Based on https://math.stackexchange.com/q/1521128 with further modifications to
-    accept a segmented line and to restrict the output to be one of the input vertices.
+    The geometric median of every group of a pile of points, all groups at once.
+
+    This runs the Weiszfeld iterations of the algorithm cited above for many
+    groups in parallel: every pixel carries the index of its group, and the
+    per-group sums of the iteration become `numpy.bincount` reductions over
+    that index. The branches of that update are reproduced per group - a group
+    whose points all sit on the current estimate keeps it, the remaining
+    groups take the damped update, and the groups without pixels settle at
+    zero, a case the per-group loop could not even process; a group stops as
+    soon as its own update moves less than `eps`, as in that loop, or when the
+    budget of `max_iter` passes is spent.
+
+    Parameters
+    ----------
+    P
+        Array of shape (n_pixels, 3) with all points of all groups.
+    owner
+        Array of shape (n_pixels,) with the index into the groups of every
+        point.
+    n_cells
+        The number of groups, which may exceed the number of groups owning
+        points.
+    eps
+        Movement below which a group's estimate counts as converged.
+
+    Returns
+    -------
+    medians
+        Array of shape (n_cells, 3) with the geometric median of every group,
+        zero for the groups without any point.
+    """
+    P = P.astype(np.float64)
+    counts = np.bincount(owner, minlength=n_cells).astype(np.float64)
+    # the starting estimate is the group's mean, NaN for a group without points
+    sums = np.stack(
+        [np.bincount(owner, weights=P[:, k], minlength=n_cells) for k in range(3)],
+        axis=1,
+    )
+    y = np.divide(
+        sums,
+        counts[:, None],
+        out=np.full((n_cells, 3), np.float64(np.nan)),
+        where=counts[:, None] > 0,
+    )
+    # a group without pixels never becomes active and keeps zero, where the
+    # per-group loop failed on the empty point set
+    medians = np.zeros((n_cells, 3))
+    active = counts > 0
+    # the cells that stopped on their own before the budget of passes ran out
+    converged_total = np.zeros(n_cells, dtype=bool)
+    iterations = 0
+    while active.any() and iterations < max_iter:
+        iterations += 1
+        # the estimate of a finished group turns the distance of its pixels
+        # into NaN, which carries zero weight everywhere and changes nothing
+        with np.errstate(invalid="ignore"):
+            distance = np.sqrt(np.sum((P - y[owner]) ** 2, axis=1))
+            inverse = np.divide(
+                1.0, distance, out=np.zeros_like(distance), where=distance > 0
+            )
+        inverse_sums = np.bincount(owner, weights=inverse, minlength=n_cells)
+        cell_sums = inverse_sums[owner]
+        weight = np.divide(
+            inverse,
+            cell_sums,
+            out=np.zeros_like(inverse),
+            where=cell_sums > 0,
+        )
+        T = np.stack(
+            [
+                np.bincount(owner, weights=weight * P[:, k], minlength=n_cells)
+                for k in range(3)
+            ],
+            axis=1,
+        )
+        zero_counts = np.bincount(
+            owner, weights=(distance == 0).astype(np.float64), minlength=n_cells
+        )
+        with np.errstate(invalid="ignore", divide="ignore"):
+            residual = (T - y) * inverse_sums[:, None]
+            r = np.sqrt(np.sum(residual**2, axis=1))
+            rinv = np.where(r == 0, 0.0, zero_counts / np.where(r == 0, 1.0, r))
+            # a group whose points all lie on its estimate takes the plain
+            # update T, skipping the damping as the cited update does; y1 is
+            # NaN for the groups without points and unused there
+            y1 = np.where(
+                (zero_counts == 0)[:, None],
+                T,
+                np.maximum(0.0, 1.0 - rinv)[:, None] * T
+                + np.minimum(1.0, rinv)[:, None] * y,
+            )
+        # as in the cited update, a converged group returns its update, while
+        # a group whose points all sit on the estimate returns that estimate
+        moved = np.sqrt(np.sum((y1 - y) ** 2, axis=1))
+        all_on_estimate = zero_counts == counts
+        converged = active & ((moved < eps) | all_on_estimate)
+        converged_total |= converged
+        # the cited code tests the all-on-estimate case before the movement,
+        # returning the estimate y rather than the update
+        medians[converged & ~all_on_estimate] = y1[converged & ~all_on_estimate]
+        medians[converged & all_on_estimate] = y[converged & all_on_estimate]
+        still_active = active & ~converged
+        y[still_active] = y1[still_active]
+        active = still_active
+    # a group that spent the budget without reaching eps keeps its latest
+    # estimate, whose distance from the true median stays below the last
+    # (sub-eps-sized) movement of the iterations
+    medians[active] = y[active]
+    n_fitted = int((counts > 0).sum())
+    n_converged = int(converged_total.sum())
+    if n_converged < n_fitted:
+        print(
+            f"geometric medians: {iterations} passes, {n_converged} of {n_fitted} "
+            f"cells converged by themselves"
+            + (
+                f", {n_fitted - n_converged} stopped at the cap of {max_iter}"
+                if n_converged < n_fitted
+                else ""
+            )
+        )
+    return medians
+
+
+def project_points_on_line_3d(
+    line: np.ndarray, points: NDArray[Any]
+) -> tuple[NDArray[Any], NDArray[Any]]:
+    """
+    Find, on a segmented line, the vertex closest to each of several points.
+
+    Based on https://math.stackexchange.com/q/1521128 with further modifications
+    to accept a segmented line and to restrict the output to one of the input
+    vertices. The search runs for all points at once, taking the segments and
+    the points as extra array axes instead of Python loops.
 
     Parameters
     ----------
     line
         3D vertices that make up the segmented line.
-    point
-        Point to find the closest vertex to.
+    points
+        Array of shape (n, 3) with the points to find the closest vertex to.
 
     Returns
     -------
-    index
-        The index of the input vertex closest to the input point.
-    vertex
-        The coordinates of the closest vertex.
+    indices
+        Array of shape (n,) with the index into the input vertices of the
+        vertex closest to every point.
+    vertices
+        Array of shape (n, 3) with the coordinates of those vertices.
     """
     # input checks
     # line needs to be 2D, each row are 3D vertex coordinates
-    # the point needs to be 3D
+    # the points need to be 2D, each row a 3D point
     assert line.ndim == 2
-    assert point.ndim == 1
+    assert points.ndim == 2
     assert line.shape[0] > 1
-    assert line.shape[1] == point.size == 3
-    # reshape for readability later
-    p = point.reshape(1, 3)
+    assert line.shape[1] == points.shape[1] == 3
     # get the Q (starting) and R (ending) points of individual segments
     q = np.atleast_2d(line[:-1, :])
     r = np.atleast_2d(line[1:, :])
     # get segment vectors
     r_minus_q = r - q
-    # get vectors to point
-    q_minus_p = q - p
-    # initialize loop over line segments
-    t = np.empty(line.shape[0] - 1)
-    g = np.empty((t.size, 3))
-    for i in range(t.size):
-        # get distance from starting point to point on line that is closest
-        # to the target point if the line segment were infiniely long
-        that = np.dot(r_minus_q[i, :], q_minus_p[i, :]) / np.dot(
-            r_minus_q[i, :], r_minus_q[i, :]
-        )
-        # restrict that distance to yield only points on the segment itself
-        t[i] = min(max(that, 0), -1)
-        # save the point on the segment that is closest to the target point
-        g[i, :] = q[i, :] - t[i] * r_minus_q[i, :]
+    # get the vectors from the starting point of every segment to every point
+    q_minus_p = q[None, :, :] - points[:, None, :]
+    # get the distance from the starting point to the point on each segment's
+    # supporting line that is closest to the target point if the line segment
+    # were infinitely long, for every point and every segment at once; the
+    # sums over the elementwise products evaluate every 3D dot product of the
+    # formula as exactly its three summands
+    that = (
+        np.sum(r_minus_q[None, :, :] * q_minus_p, axis=2)
+        / np.sum(r_minus_q * r_minus_q, axis=1)[None, :]
+    )
+    # restrict that distance to yield only points on the segment itself; the
+    # clamp bounds [0, -1] look inverted but are deliberate, kept from the
+    # original formula - do not "fix" them without checking the examples,
+    # and note that NaN passes through both clamp bounds unchanged
+    t = np.minimum(np.maximum(that, 0), -1)
+    # save the point on every segment that is closest to every target point
+    g = q[None, :, :] - t[:, :, None] * r_minus_q[None, :, :]
     # the globally closest point on the line has the minimum Euclidean distance
-    dists_line = np.sqrt(np.sum((g - p) ** 2, axis=1))
-    # find index and point closest to target point on entire line
-    ix_line = np.argmin(dists_line)
-    g_line = g[ix_line, :]
-    # if it's not already the vertex, find the vertex that is closest to the point
-    # on the line segment
-    dists_vertices = np.sqrt(np.sum((g_line - line) ** 2, axis=1))
-    # return the index and location of the vertex that is closest to the target point
-    index = np.argmin(dists_vertices)
-    vertex = line[index, :]
-    return index, vertex
+    dists_line = np.sqrt(np.sum((g - points[:, None, :]) ** 2, axis=2))
+    # find the point closest to the line and the vertex closest to it
+    g_line = g[np.arange(points.shape[0]), dists_line.argmin(axis=1), :]
+    dists_vertices = np.sqrt(
+        np.sum((g_line[:, None, :] - line[None, :, :]) ** 2, axis=2)
+    )
+    # return the indices and locations of the vertices closest to the points
+    indices = dists_vertices.argmin(axis=1)
+    return indices, line[indices]
 
 
 def load_image(filename: str) -> RGBImage:
@@ -217,26 +321,40 @@ def extract_dominant_colors(
     # get grid that defines the different sub-images
     borders_x = cell_borders(data_box, nx, "x")
     borders_y = cell_borders(data_box, ny, "y")
-    # initialize loop over sub-images
-    cmed = np.empty((borders_y.size - 1, borders_x.size - 1, 3))
-    for i in range(cmed.shape[0]):
-        for j in range(cmed.shape[1]):
-            # extract sub-image
-            subimg = img[
-                borders_y[i] : borders_y[i + 1], borders_x[j] : borders_x[j + 1], :
-            ].reshape(-1, 3)
-            # if ignoring black colors, remove the pixels that are too close
-            # given the input radius
-            if ignore_black is not None:
-                not_black_ix = (
-                    np.sqrt(np.sum(subimg.astype(float) ** 2, axis=1)) > ignore_black
-                )
-                subimg = subimg[not_black_ix, :]
-            # get the most common ("dominant") color using something similar to
-            # the median but in 3D
-            cmed[i, j, :] = geometric_median(subimg)
-    # make sure the colors are in the normal 0-255 integer RGB range
-    return np.clip(cmed, a_min=0, a_max=255).astype(int)
+    n_cells_y = borders_y.size - 1
+    n_cells_x = borders_x.size - 1
+    # take the pixels of the whole data box at once and give every pixel the
+    # index of the cell whose sub-image contains it, so that the loop over the
+    # sub-images becomes one grouped median over all cells; a pixel belongs to
+    # the cell whose left border is the last border not behind it, which
+    # reproduces the half-open slice of the per-cell extraction it replaces
+    pixels = img[borders_y[0] : borders_y[-1], borders_x[0] : borders_x[-1], :]
+    pixels = pixels.reshape(-1, 3)
+    cell_x = (
+        np.searchsorted(borders_x, np.arange(borders_x[0], borders_x[-1]), side="right")
+        - 1
+    )
+    cell_y = (
+        np.searchsorted(borders_y, np.arange(borders_y[0], borders_y[-1]), side="right")
+        - 1
+    )
+    owner = (cell_y[:, None] * n_cells_x + cell_x[None, :]).ravel()
+    # if ignoring black colors, remove the pixels that are too close
+    # given the input radius
+    if ignore_black is not None:
+        not_black_ix = np.sqrt(np.sum(pixels.astype(float) ** 2, axis=1)) > ignore_black
+        pixels = pixels[not_black_ix]
+        owner = owner[not_black_ix]
+    # get the most common ("dominant") color of every cell using something
+    # similar to the median but in 3D
+    cmed = geometric_medians(pixels, owner, n_cells_y * n_cells_x).reshape(
+        n_cells_y, n_cells_x, 3
+    )
+    # make sure the colors are in the normal 0-255 integer RGB range; the
+    # rounding rather than truncating matters because the iterative median
+    # carries float noise far below a color unit, which bare truncation would
+    # turn into off-by-one colors whenever the true value is an integer
+    return np.clip(cmed, a_min=0, a_max=255).round().astype(int)
 
 
 def nan_color_mask(
@@ -377,21 +495,21 @@ def colors_to_colorline_indices(
         Array of shape (ny, nx) with the mean index into the pixels of the
         colorbar whose color matches the dominant color of every cell.
     """
-    # initialize loop over all dominant colors
-    indices_unique = np.empty(cmed.shape[:2], dtype=int)
-    indices_general = np.empty_like(indices_unique)
-    for i in range(cmed.shape[0]):
-        for j in range(cmed.shape[1]):
-            # find the color on the colorbar that is closest in 3D RGB space
-            # to the dominant color that was extracted in the previous step
-            indices_unique[i, j], gix = project_point_on_line_3d(
-                colorline_unique, cmed[i, j, :]
-            )
-            # since colors can repeat in a colorbar, we need to decide which pixel
-            # to map into data space - here we use the mean one
-            indices_general[i, j] = np.flatnonzero(
-                np.all(gix == colorline, axis=1)
-            ).mean()
+    # find the color on the colorbar that is closest in 3D RGB space to the
+    # dominant color of every cell, for all cells at once
+    indices_unique, _ = project_points_on_line_3d(colorline_unique, cmed.reshape(-1, 3))
+    indices_unique = indices_unique.reshape(cmed.shape[:2])
+    # since colors can repeat in a colorbar, we need to decide which pixel
+    # to map into data space - here we use the mean one; every pixel of the
+    # colorbar equals exactly one of the unique colors, so gather the pixel
+    # positions of every unique color once and take their mean
+    repeats = np.all(colorline[:, None, :] == colorline_unique[None, :, :], axis=2)
+    mean_pixels = (np.arange(colorline.shape[0])[:, None] * repeats).sum(
+        axis=0
+    ) / repeats.sum(axis=0)
+    # taking the whole part of the mean maps every cell onto a whole colorbar
+    # pixel, as the integer assignment of the original per-cell extraction did
+    indices_general = mean_pixels[indices_unique].astype(int)
     return indices_unique, indices_general
 
 

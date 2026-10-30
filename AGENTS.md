@@ -85,9 +85,9 @@ engineers.
 
 ## Notes on the existing implementation
 
-- `geometric_median` is copied code (StackOverflow answer, CC-BY-SA 3.0 / zlib);
-  keep its license comment intact.
-- `project_point_on_line_3d` contains a deliberate-looking clamp
+- `geometric_medians` derives from copied code (StackOverflow answer,
+  CC-BY-SA 3.0 / zlib); keep the attribution comment above it intact.
+- `project_points_on_line_3d` contains a deliberate-looking clamp
   `min(max(that, 0), -1)`; verify against tests/examples before "fixing" it, and
   do not change it as drive-by cleanup.
 - Colors are handled as integer RGB triples in the range 0–255; the colorbar is
